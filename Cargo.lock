@@ -7061,6 +7061,7 @@ dependencies = [
  "downcast-rs",
  "dyn-clone",
  "educe",
+ "event-listener",
  "futures",
  "futures-await-test",
  "hex",

@@ -3,6 +3,7 @@
 // TODO HS TEST: We need tests here. First, though, we need a testing strategy.
 mod config;
 mod pool;
+mod wait;
 
 use std::{
     ops::Deref,
@@ -397,6 +398,8 @@ pub(crate) struct HsCircPoolInner<B: AbstractTunnelBuilder<R> + 'static, R: Runt
     launcher_handle: OnceCell<TaskHandle>,
     /// The mutable state of this pool.
     inner: Mutex<Inner<B::Tunnel>>,
+    /// Wake pending acquisitions when a preemptive circuit enters the pool.
+    available: event_listener::Event,
 }
 
 /// The mutable state of an [`HsCircPool`]
@@ -421,6 +424,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
             circmgr,
             launcher_handle: OnceCell::new(),
             inner: Mutex::new(Inner { pool }),
+            available: event_listener::Event::new(),
         }
     }
 
@@ -661,7 +665,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
             }
         };
 
-        let found_usable_circ = {
+        let take_available = || {
             let mut inner = self.inner.lock().expect("lock poisoned");
 
             let restrictions = |circ: &HsCircStem<B::Tunnel>| {
@@ -709,34 +713,26 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
                 })?;
                 handle.fire();
             }
-            found_usable_circ
+            Ok(found_usable_circ)
         };
-        // Return the circuit we found before, if any.
-        if let Some(circuit) = found_usable_circ {
-            let circuit = self
-                .maybe_extend_stem_circuit(netdir, circuit, avoid_target, stem_kind, kind)
+        let build = async {
+            let circ = self
+                .circmgr
+                .launch_hs_unmanaged(avoid_target, netdir, stem_kind, Some(kind))
                 .await?;
-            self.ensure_suitable_circuit(&circuit, avoid_target, stem_kind)?;
-            return Ok(circuit);
-        }
-
-        // TODO: There is a possible optimization here. Instead of only waiting
-        // for the circuit we launch below to finish, we could also wait for any
-        // of our in-progress preemptive circuits to finish.  That would,
-        // however, complexify our logic quite a bit.
-
-        // TODO: We could in launch multiple circuits in parallel here?
-        let circ = self
-            .circmgr
-            .launch_hs_unmanaged(avoid_target, netdir, stem_kind, Some(kind))
+            Ok(HsCircStem {
+                circ,
+                kind: stem_kind,
+            })
+        };
+        // Recheck the same compatibility predicate when a background build
+        // completes. This does not launch additional circuits or HS requests.
+        let circuit = wait::take_or_build(&self.available, take_available, build).await?;
+        let circuit = self
+            .maybe_extend_stem_circuit(netdir, circuit, avoid_target, stem_kind, kind)
             .await?;
-
-        self.ensure_suitable_circuit(&circ, avoid_target, stem_kind)?;
-
-        Ok(HsCircStem {
-            circ,
-            kind: stem_kind,
-        })
+        self.ensure_suitable_circuit(&circuit, avoid_target, stem_kind)?;
+        Ok(circuit)
     }
 
     /// Return a circuit of the specified `kind`, built from `circuit`.
@@ -1194,6 +1190,7 @@ async fn launch_hs_circuits_as_needed<B: AbstractTunnelBuilder<R> + 'static, R: 
                         let kind = for_launch.kind();
                         let circ = HsCircStem { circ, kind };
                         pool.inner.lock().expect("poisoned lock").pool.insert(circ);
+                        pool.available.notify(usize::MAX);
                         trace!("successfully launched {kind} circuit");
                         for_launch.note_circ_launched();
                     }

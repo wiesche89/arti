@@ -69,7 +69,7 @@ experimental-api = ["visibility", "__is_experimental"]
 send-control-msg = ["tor-proto/send-control-msg"]
 hs-client = ["hs-common"]
 hs-service = ["hs-common", "tor-proto/hs-service"]
-hs-common = []
+hs-common = ["dep:event-listener"]
 __is_experimental = []
 
 [dependencies]
@@ -82,6 +82,7 @@ derive_more = { version = "2.0.1", features = ["full"] }
 downcast-rs = "2.0.1"
 dyn-clone = "1.0.4"
 educe = "0.4.22"
+event-listener = { version = "5", optional = true }
 futures = "0.3.14"
 humantime-serde = "1.1.1"
 itertools = "0.14.0"
