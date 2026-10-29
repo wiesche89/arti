@@ -226,7 +226,14 @@ impl RendRequest {
                 self.context.netdir_provider.clone(),
             )
             .await
-            .map_err(ClientError::EstablishSession)?;
+            .map_err(|error| {
+                // The tracing-to-log fallback only displays the outer Error
+                // field. Keep the cause chain and service identity available
+                // without logging the introduction payload or handshake keys.
+                warn!(nickname=%self.context.nickname,
+                    "Rendezvous establishment failed: {}", error.report());
+                ClientError::EstablishSession(error)
+            })?;
 
         let tunnel = Arc::new(tunnel);
 
