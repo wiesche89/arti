@@ -1357,6 +1357,24 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             }
         };
 
+        // A rate-limited pass can become redundant while earlier uploads finish.
+        // Restore the status from their results instead of leaving the service
+        // in Bootstrapping without any pending upload to update it again.
+        let all_clean = {
+            let inner = self.inner.lock().expect("poisoned lock");
+            !inner.time_periods.is_empty()
+                && inner.time_periods.iter().all(|period| {
+                    period
+                        .hs_dirs
+                        .iter()
+                        .all(|(_, status)| *status == DescriptorStatus::Clean)
+                })
+        };
+        if all_clean {
+            self.upload_result_to_svc_status()?;
+            return Ok(());
+        }
+
         let last_uploaded = self.inner.lock().expect("poisoned lock").last_uploaded;
         let now = self.imm.runtime.now();
         // Check if we should rate-limit this upload.
@@ -1392,7 +1410,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
             if hs_dirs.is_empty() {
                 trace!("the descriptor is clean for all HSDirs. Nothing to do");
-                return Ok(());
+                continue;
             }
 
             let time_period = period_ctx.params.time_period();
@@ -2206,6 +2224,143 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use tor_netdir::testnet;
+
+    #[test]
+    fn completed_uploads_survive_a_redundant_scheduled_publication() {
+        use crate::publish::test::{MockReactorState, build_test_config, init_keymgr};
+        use crate::status::{OnionServiceStatus, StatusSender};
+        use tor_netdir::testprovider::TestNetDirProvider;
+        use tor_rtcompat::ToplevelBlockOn;
+        use tor_rtmock::MockRuntime;
+
+        let runtime = MockRuntime::new();
+        runtime.clone().block_on(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let netdir = Arc::new(construct_netdir());
+            let nickname = HsNickname::new("completed-publication".into()).unwrap();
+            let config = build_test_config(nickname.clone());
+            let (_, _, keymgr) = init_keymgr(&temp, &nickname, &netdir);
+            let (_config_tx, config_rx) = watch::channel_with(Arc::new(config.clone()));
+            let (mut mv, pv) = crate::ipt_set::ipts_channel(
+                &runtime,
+                crate::test::create_storage_handles(temp.path()).1,
+            )
+            .unwrap();
+            let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
+            let dir_provider: Arc<dyn NetDirProvider> =
+                Arc::new(TestNetDirProvider::from((*netdir).clone()));
+            let state_dir = StateDirectory::new(
+                temp.path().join("state"),
+                &fs_mistrust::Mistrust::new_dangerously_trust_everyone(),
+            )
+            .unwrap();
+            let instance = state_dir.acquire_instance(&nickname).unwrap();
+            let crate::pow::NewPowManager {
+                pow_manager,
+                publisher_update_rx,
+                ..
+            } = PowManager::new(
+                runtime.clone(),
+                nickname.clone(),
+                instance.raw_subdir("pow_nonces").unwrap(),
+                keymgr.clone(),
+                instance.storage_handle("pow_manager").unwrap(),
+                dir_provider.clone(),
+                status_tx.clone().into(),
+                config_rx.clone(),
+            )
+            .unwrap();
+            let publish_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mock = MockReactorState {
+                publish_count: publish_count.clone(),
+                poll_read_responses: vec![Ok("HTTP/1.1 200 OK\r\n\r\n".to_string())].into_iter(),
+                responses_for_hsdir: Default::default(),
+            };
+            let mut reactor = Reactor::new(
+                runtime.clone(),
+                nickname,
+                dir_provider,
+                mock,
+                &config,
+                pv,
+                config_rx,
+                status_tx.clone().into(),
+                keymgr,
+                Arc::new(CfgPathResolver::default()),
+                pow_manager,
+                publisher_update_rx,
+            );
+            {
+                let mut inner = reactor.inner.lock().unwrap();
+                inner.netdir = Some(netdir.clone());
+                inner.time_periods = netdir
+                    .hs_all_time_periods()
+                    .iter()
+                    .map(|params| {
+                        let mut ctx = create_time_period_ctx(params, create_upload_results(Ok(())));
+                        ctx.hs_dirs = vec![(RelayIds::empty(), DescriptorStatus::Clean)];
+                        ctx
+                    })
+                    .collect();
+            }
+            // The rate-limit timer schedules another pass after the in-flight
+            // uploads have already completed. No network request is necessary.
+            reactor
+                .update_publish_status(PublishStatus::UploadScheduled)
+                .await
+                .unwrap();
+            reactor.upload_all().await.unwrap();
+            let status = status_tx
+                .subscribe()
+                .next()
+                .await
+                .unwrap()
+                .publisher_status();
+            assert_eq!(status.state(), State::Running);
+            assert!(status.current_problem().is_none());
+            assert_eq!(publish_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            // A clean first period must not suppress uploads for a later one.
+            reactor
+                .handle_consensus_change(netdir.clone())
+                .await
+                .unwrap();
+            let first_period = {
+                let mut inner = reactor.inner.lock().unwrap();
+                inner.last_uploaded = None;
+                assert!(inner.time_periods.len() >= 2);
+                for (_, status) in &mut inner.time_periods[0].hs_dirs {
+                    *status = DescriptorStatus::Clean;
+                }
+                inner.time_periods[0].params.time_period()
+            };
+            let ipts = tor_netdoc::doc::hsdesc::test_data::test_parsed_hsdesc()
+                .unwrap()
+                .intro_points()
+                .iter()
+                .enumerate()
+                .map(|(i, ipt)| crate::ipt_set::IptInSet {
+                    ipt: ipt.clone(),
+                    lid: [i as u8; 32].into(),
+                })
+                .collect();
+            mv.borrow_for_update(runtime.clone()).ipts = Some(crate::ipt_set::IptSet {
+                ipts,
+                lifetime: Duration::from_secs(1200),
+            });
+            reactor.upload_all().await.unwrap();
+            runtime.progress_until_stalled().await;
+            assert!(publish_count.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            let completed = reactor.upload_task_complete_rx.next().await.unwrap();
+            assert_ne!(completed.time_period, first_period);
+            assert!(
+                completed
+                    .hsdir_result
+                    .iter()
+                    .all(|result| result.upload_res.is_ok())
+            );
+        });
+    }
 
     /// Create a `TimePeriodContext` from the specified upload results.
     fn create_time_period_ctx(

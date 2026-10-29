@@ -217,7 +217,7 @@ mod test {
     type PollReadResult<T> = Result<T, ()>;
 
     /// A trait for our poll_read response iterator.
-    trait PollReadIter:
+    pub(super) trait PollReadIter:
         Iterator<Item = PollReadResult<String>> + Send + Sync + Clone + Unpin + 'static
     {
     }
@@ -228,9 +228,9 @@ mod test {
     }
 
     #[derive(Clone, Debug, Default)]
-    struct MockReactorState<I: PollReadIter> {
+    pub(super) struct MockReactorState<I: PollReadIter> {
         /// The number of `POST /tor/hs/3/publish` requests sent by the reactor.
-        publish_count: Arc<AtomicUsize>,
+        pub(super) publish_count: Arc<AtomicUsize>,
         /// The values returned by `DataStream::poll_read` when uploading to an HSDir.
         ///
         /// The values represent the HTTP response (or lack thereof) each HSDir sends upon
@@ -239,11 +239,11 @@ mod test {
         /// Note: this field is only used for populating responses_for_hsdir. Each time
         /// get_or_launch_specific is called for a new CircTarget, this iterator is cloned and
         /// added to the responses_for_hsdir entry corresponding to the new CircTarget (HSDir).
-        poll_read_responses: I,
+        pub(super) poll_read_responses: I,
         /// The responses that will be returned by each test HSDir (identified by its RsaIdentity).
         ///
         /// Used for testing whether the reactor correctly retries on failure.
-        responses_for_hsdir: Arc<Mutex<HashMap<rsa::RsaIdentity, I>>>,
+        pub(super) responses_for_hsdir: Arc<Mutex<HashMap<rsa::RsaIdentity, I>>>,
     }
 
     #[async_trait]
@@ -283,7 +283,7 @@ mod test {
     }
 
     #[derive(Debug, Clone)]
-    struct MockClientCirc<I: PollReadIter> {
+    pub(super) struct MockClientCirc<I: PollReadIter> {
         /// The number of `POST /tor/hs/3/publish` requests sent by the reactor.
         publish_count: Arc<AtomicUsize>,
         /// The values to return from `poll_read`.
@@ -312,7 +312,7 @@ mod test {
     }
 
     #[derive(Debug)]
-    struct MockDataStream<I: PollReadIter> {
+    pub(super) struct MockDataStream<I: PollReadIter> {
         /// The number of `POST /tor/hs/3/publish` requests sent by the reactor.
         publish_count: Arc<AtomicUsize>,
         /// The values to return from `poll_read`.
@@ -394,7 +394,7 @@ mod test {
     }
 
     /// Create a new `KeyMgr`, provisioning its keystore with the necessary keys.
-    fn init_keymgr(
+    pub(super) fn init_keymgr(
         keystore_dir: &TempDir,
         nickname: &HsNickname,
         netdir: &NetDir,
@@ -455,7 +455,7 @@ mod test {
         (hs_id, hs_blind_id_key.into(), keymgr.into())
     }
 
-    fn build_test_config(nickname: HsNickname) -> OnionServiceConfig {
+    pub(super) fn build_test_config(nickname: HsNickname) -> OnionServiceConfig {
         OnionServiceConfigBuilder::default()
             .nickname(nickname)
             .rate_limit_at_intro(None)
