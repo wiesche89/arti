@@ -117,8 +117,11 @@ impl<B: BackoffSchedule, R: Runtime> Runner<B, R> {
                             return Err(BackoffError::ExplicitStop(errors));
                         };
 
-                        // Introduce the specified delay between retries
-                        let () = self.runtime.sleep(delay).await;
+                        // The overall budget also bounds the pause between retries.
+                        select_biased! {
+                            () = overall_timeout => return Err(BackoffError::Timeout(errors)),
+                            () = self.runtime.sleep(delay).fuse() => {},
+                        }
 
                         // Try again unless the entire operation has timed out.
                         continue;
@@ -443,6 +446,39 @@ mod tests {
             "backoff with max_retries and no timeout (transient errors followed by a fatal error)",
             Duration::from_millis(SHORT_DELAY.as_millis() as u64 * EXPECTED_TOTAL_RUNS as u64),
         );
+    }
+
+    #[test]
+    fn overall_timeout_interrupts_retry_delay() {
+        struct LongRetryDelay;
+        impl_backoff_sched!(
+            LongRetryDelay,
+            None,
+            Some(TIMEOUT),
+            None,
+            Some(TIMEOUT * 10)
+        );
+        let runtime = MockRuntime::new();
+        runtime.clone().block_on(async move {
+            let runner = Runner::new(
+                "retry with long delay".into(),
+                LongRetryDelay,
+                runtime.clone(),
+            );
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            let result = runner.run(|| async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(TestError::Transient)
+            });
+            futures::pin_mut!(result);
+            assert!(result.as_mut().now_or_never().is_none());
+            runtime.advance_by(TIMEOUT).await;
+            assert!(matches!(
+                result.now_or_never(),
+                Some(Err(BackoffError::Timeout(_)))
+            ));
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 
     #[test]
