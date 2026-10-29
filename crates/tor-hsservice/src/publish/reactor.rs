@@ -529,11 +529,6 @@ impl TimePeriodContext {
             .iter_mut()
             .for_each(|(_relay_id, status)| *status = DescriptorStatus::Dirty);
     }
-
-    /// Update the upload result for this time period.
-    fn set_upload_results(&mut self, upload_results: Vec<HsDirUploadStatus>) {
-        self.upload_results = upload_results;
-    }
 }
 
 /// An error that occurs while trying to upload a descriptor.
@@ -591,8 +586,8 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
         /// The maximum size of the upload completion notifier channel.
         ///
         /// The channel we use this for is a futures::mpsc channel, which has a capacity of
-        /// `UPLOAD_CHAN_BUF_SIZE + num-senders`. We don't need the buffer size to be non-zero, as
-        /// each sender will send exactly one message.
+        /// `UPLOAD_CHAN_BUF_SIZE + num-senders`. Each sender reports per-HSDir progress;
+        /// backpressure keeps the number of queued results bounded.
         const UPLOAD_CHAN_BUF_SIZE: usize = 0;
 
         // Internally-generated instructions, no need for mq.
@@ -882,29 +877,32 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             return;
         };
 
-        // We will need to reupload this descriptor at some point, so we pick
-        // a random time between 60 minutes and 120 minutes in the future.
-        //
-        // See https://spec.torproject.org/rend-spec/deriving-keys.html#WHEN-HSDESC
-        let mut rng = self.imm.mockable.thread_rng();
-        // TODO SPEC: Control republish period using a consensus parameter?
-        let minutes = rng.gen_range_checked(60..=120).expect("low > high?!");
-        let duration = Duration::from_secs(minutes * 60);
-        let reupload_when = self.imm.runtime.now() + duration;
-        let time_period = period.params.time_period();
+        // Only the final result schedules the next publication, not every
+        // intermediate HSDir completion.
+        if results.batch_complete {
+            // We will need to reupload this descriptor at some point, so we pick
+            // a random time between 60 minutes and 120 minutes in the future.
+            //
+            // See https://spec.torproject.org/rend-spec/deriving-keys.html#WHEN-HSDESC
+            let mut rng = self.imm.mockable.thread_rng();
+            // TODO SPEC: Control republish period using a consensus parameter?
+            let minutes = rng.gen_range_checked(60..=120).expect("low > high?!");
+            let duration = Duration::from_secs(minutes * 60);
+            let reupload_when = self.imm.runtime.now() + duration;
+            let time_period = period.params.time_period();
 
-        info!(
-            time_period=?time_period,
-            "reuploading descriptor in {}",
-            humantime::format_duration(duration),
-        );
+            info!(
+                time_period=?time_period,
+                "reuploading descriptor in {}",
+                humantime::format_duration(duration),
+            );
 
-        inner.reupload_timers.push(ReuploadTimer {
-            period: time_period,
-            when: reupload_when,
-        });
+            inner.reupload_timers.push(ReuploadTimer {
+                period: time_period,
+                when: reupload_when,
+            });
+        }
 
-        let mut upload_results = vec![];
         for upload_res in results.hsdir_result {
             let relay = period
                 .hs_dirs
@@ -925,25 +923,22 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
                 if update_last_successful {
                     period.last_successful = Some(upload_res.revision_counter);
-                    // TODO (#1098): Is it possible that this won't update the statuses promptly
-                    // enough. For example, it's possible for the reactor to see a Dirty descriptor
-                    // and start an upload task for a descriptor has already been uploaded (or is
-                    // being uploaded) in another task, but whose upload results have not yet been
-                    // processed.
-                    //
-                    // This is probably made worse by the fact that the statuses are updated in
-                    // batches (grouped by time period), rather than one by one as the upload tasks
-                    // complete (updating the status involves locking the inner mutex, and I wanted
-                    // to minimize the locking/unlocking overheads). I'm not sure handling the
-                    // updates in batches was the correct decision here.
                     *status = DescriptorStatus::Clean;
                 }
             }
 
-            upload_results.push(upload_res);
+            // A progress update (or retry of only dirty HSDirs) must not erase
+            // the known outcomes for the other relays in this period.
+            if let Some(previous) = period
+                .upload_results
+                .iter_mut()
+                .find(|previous| previous.relay_ids == upload_res.relay_ids)
+            {
+                *previous = upload_res;
+            } else {
+                period.upload_results.push(upload_res);
+            }
         }
-
-        period.set_upload_results(upload_results);
     }
 
     /// Maybe update our list of HsDirs.
@@ -1554,7 +1549,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             .try_into()
             .expect("Unable to convert positive int32 to usize!?");
 
-        let upload_results = futures::stream::iter(hs_dirs)
+        let mut upload_results = futures::stream::iter(hs_dirs)
             .map(|relay_ids| {
                 let netdir = netdir.clone();
                 let config = Arc::clone(&config);
@@ -1616,12 +1611,9 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                         // uploaded the descriptor to some, but not all, HSDirs from the specified
                         // time period.
                         //
-                        // Returning an error here means the upload completion task is never
-                        // notified of the outcome of any of these uploads (which means the
-                        // descriptor is not marked clean). This is OK, because if we suddenly find
-                        // out we have no IPTs, it means our built `hsdesc` has an outdated set of
-                        // IPTs, so we need to go back to the main loop to wait for IPT changes,
-                        // and generate a fresh descriptor anyway.
+                        // Earlier uploads may already have been reported. The main
+                        // loop invalidates them when it handles the IPT change,
+                        // then waits for IPTs before generating fresh descriptors.
                         //
                         // Ideally, this shouldn't happen very often (if at all).
                         let Some(ipts) = ipt_set.ipts.as_mut() else {
@@ -1715,55 +1707,56 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             })
             // This fails to compile unless the stream is boxed. See https://github.com/rust-lang/rust/issues/104382
             .boxed()
-            .buffer_unordered(MAX_CONCURRENT_UPLOADS)
-            .try_collect::<Vec<_>>()
-            .await;
+            .buffer_unordered(MAX_CONCURRENT_UPLOADS);
 
-        let upload_results = match upload_results {
-            Ok(v) => v,
-            Err(PublishError::Fatal(e)) => return Err(e),
-            Err(PublishError::NoIpts) => {
-                debug!(
-                    nickname=%imm.nickname, time_period=?time_period,
-                     "no introduction points; skipping upload"
-                );
+        let mut completed = 0;
+        let mut succeeded = 0;
+        while let Some(result) = upload_results.next().await {
+            let result = match result {
+                Ok(result) => result,
+                Err(PublishError::Fatal(e)) => return Err(e),
+                Err(PublishError::NoIpts) => {
+                    debug!(
+                        nickname=%imm.nickname, time_period=?time_period,
+                        "no introduction points; skipping upload"
+                    );
+                    return Ok(());
+                }
+                Err(PublishError::Shutdown) => {
+                    debug!(
+                        nickname=%imm.nickname, time_period=?time_period,
+                        "the reactor has shut down; aborting upload"
+                    );
+                    return Ok(());
+                }
+            };
+            completed += 1;
+            succeeded += usize::from(result.upload_res.is_ok());
 
-                return Ok(());
+            // Report each completed upload immediately. One slow HSDir must
+            // not hide successful publication to the rest of either ring.
+            if upload_task_complete_tx
+                .send(TimePeriodUploadResult {
+                    generation: generation.clone(),
+                    time_period,
+                    hsdir_result: vec![result],
+                    batch_complete: completed == hsdir_count,
+                })
+                .await
+                .is_err()
+            {
+                return Err(internal!(
+                    "failed to notify reactor of upload completion (reactor shut down)"
+                )
+                .into());
             }
-            Err(PublishError::Shutdown) => {
-                debug!(
-                    nickname=%imm.nickname, time_period=?time_period,
-                     "the reactor has shut down; aborting upload"
-                );
-
-                return Ok(());
-            }
-        };
-
-        let (succeeded, _failed): (Vec<_>, Vec<_>) = upload_results
-            .iter()
-            .partition(|res| res.upload_res.is_ok());
+        }
 
         debug!(
             nickname=%imm.nickname, time_period=?time_period,
             "descriptor uploaded successfully to {}/{} HSDirs",
-            succeeded.len(), hsdir_count
+            succeeded, hsdir_count
         );
-
-        if upload_task_complete_tx
-            .send(TimePeriodUploadResult {
-                generation,
-                time_period,
-                hsdir_result: upload_results,
-            })
-            .await
-            .is_err()
-        {
-            return Err(internal!(
-                "failed to notify reactor of upload completion (reactor shut down)"
-            )
-            .into());
-        }
 
         Ok(())
     }
@@ -2205,6 +2198,8 @@ struct TimePeriodUploadResult {
     time_period: TimePeriod,
     /// The upload results.
     hsdir_result: Vec<HsDirUploadStatus>,
+    /// Whether all HSDirs in this publication have finished (including failures).
+    batch_complete: bool,
 }
 
 /// Cancels retries of obsolete descriptors when a newer publication replaces them.
@@ -2273,7 +2268,7 @@ mod test {
     use tor_netdir::testnet;
 
     #[test]
-    fn completed_uploads_survive_a_redundant_scheduled_publication() {
+    fn publication_results_preserve_progress_and_ignore_superseded_uploads() {
         use crate::publish::test::{MockReactorState, build_test_config, init_keymgr};
         use crate::status::{OnionServiceStatus, StatusSender};
         use tor_netdir::testprovider::TestNetDirProvider;
@@ -2398,7 +2393,12 @@ mod test {
             reactor.upload_all().await.unwrap();
             runtime.progress_until_stalled().await;
             assert!(publish_count.load(std::sync::atomic::Ordering::SeqCst) > 0);
-            let completed = reactor.upload_task_complete_rx.next().await.unwrap();
+            let completed = loop {
+                let result = reactor.upload_task_complete_rx.next().await.unwrap();
+                if result.batch_complete {
+                    break result;
+                }
+            };
             assert_ne!(completed.time_period, first_period);
             let old = completed.clone();
             let old_abort = reactor
@@ -2424,11 +2424,13 @@ mod test {
             runtime.progress_until_stalled().await;
             let current = loop {
                 let result = reactor.upload_task_complete_rx.next().await.unwrap();
-                if reactor.uploads.iter().any(|upload| {
-                    result.time_period == completed.time_period
-                        && upload.period == result.time_period
-                        && Arc::ptr_eq(&upload.generation, &result.generation)
-                }) {
+                if result.batch_complete
+                    && reactor.uploads.iter().any(|upload| {
+                        result.time_period == completed.time_period
+                            && upload.period == result.time_period
+                            && Arc::ptr_eq(&upload.generation, &result.generation)
+                    })
+                {
                     break result;
                 }
             };
@@ -2476,6 +2478,152 @@ mod test {
                     .hsdir_result
                     .iter()
                     .all(|result| result.upload_res.is_ok())
+            );
+
+            // One HSDir keeps failing while all others accept the descriptor.
+            // Successful uploads from both rings must be visible before its
+            // retry budget expires, without scheduling a timer for every result.
+            let (slow_relay, expected_successes, affected_periods, period_count) = {
+                let mut inner = reactor.inner.lock().unwrap();
+                inner.last_uploaded = None;
+                let slow = inner.time_periods[0].hs_dirs[0].0.clone();
+                let affected = inner
+                    .time_periods
+                    .iter()
+                    .filter(|ctx| ctx.hs_dirs.iter().any(|(id, _)| id == &slow))
+                    .count();
+                let expected = inner
+                    .time_periods
+                    .iter()
+                    .map(|ctx| ctx.hs_dirs.len())
+                    .sum::<usize>()
+                    - affected;
+                for ctx in &mut inner.time_periods {
+                    ctx.upload_results.clear();
+                }
+                (slow, expected, affected, inner.time_periods.len())
+            };
+            reactor
+                .imm
+                .mockable
+                .responses_for_hsdir
+                .lock()
+                .unwrap()
+                .insert(
+                    *slow_relay.rsa_identity().unwrap(),
+                    vec![Err(())].into_iter(),
+                );
+            let timers_before = reactor.inner.lock().unwrap().reupload_timers.len();
+            let started = runtime.now();
+            reactor.upload_all().await.unwrap();
+            loop {
+                runtime.progress_until_stalled().await;
+                match reactor.upload_task_complete_rx.next().now_or_never() {
+                    Some(Some(result)) => reactor.handle_upload_results(result),
+                    _ => break,
+                }
+            }
+            assert_eq!(runtime.now(), started, "no retry deadline has elapsed");
+            {
+                let inner = reactor.inner.lock().unwrap();
+                assert_eq!(
+                    upload_result_state(&netdir, &inner.time_periods).0,
+                    State::Running
+                );
+                assert_eq!(
+                    inner
+                        .time_periods
+                        .iter()
+                        .map(|ctx| ctx.upload_results.len())
+                        .sum::<usize>(),
+                    expected_successes
+                );
+                assert_eq!(
+                    inner.reupload_timers.len(),
+                    timers_before + period_count - affected_periods
+                );
+                assert!(
+                    inner
+                        .time_periods
+                        .iter()
+                        .flat_map(|ctx| &ctx.hs_dirs)
+                        .filter(|(id, _)| id == &slow_relay)
+                        .all(|(_, status)| *status == DescriptorStatus::Dirty)
+                );
+            }
+            // Exhausting that HSDir's retry budget must still expose the
+            // failure, retain the other results, and finish each timer once.
+            runtime
+                .advance_by(OVERALL_UPLOAD_TIMEOUT + Duration::from_secs(1))
+                .await;
+            loop {
+                runtime.progress_until_stalled().await;
+                match reactor.upload_task_complete_rx.next().now_or_never() {
+                    Some(Some(result)) => reactor.handle_upload_results(result),
+                    _ => break,
+                }
+            }
+            let inner = reactor.inner.lock().unwrap();
+            let (state, problem) = upload_result_state(&netdir, &inner.time_periods);
+            assert_eq!(state, State::DegradedReachable);
+            assert!(problem.is_some());
+            assert_eq!(
+                inner
+                    .time_periods
+                    .iter()
+                    .flat_map(|ctx| &ctx.upload_results)
+                    .filter(|result| result.upload_res.is_ok())
+                    .count(),
+                expected_successes
+            );
+            assert_eq!(inner.reupload_timers.len(), timers_before + period_count);
+            drop(inner);
+
+            // Retry only the failed relay. Its success replaces its failure
+            // without discarding the already-clean relays or reuploading them.
+            reactor
+                .imm
+                .mockable
+                .responses_for_hsdir
+                .lock()
+                .unwrap()
+                .insert(
+                    *slow_relay.rsa_identity().unwrap(),
+                    vec![Ok("HTTP/1.1 200 OK\r\n\r\n".into())].into_iter(),
+                );
+            reactor.inner.lock().unwrap().last_uploaded = None;
+            let uploads_before = publish_count.load(std::sync::atomic::Ordering::SeqCst);
+            reactor.upload_all().await.unwrap();
+            loop {
+                runtime.progress_until_stalled().await;
+                match reactor.upload_task_complete_rx.next().now_or_never() {
+                    Some(Some(result)) => reactor.handle_upload_results(result),
+                    _ => break,
+                }
+            }
+            assert_eq!(
+                publish_count.load(std::sync::atomic::Ordering::SeqCst),
+                uploads_before + affected_periods
+            );
+            let inner = reactor.inner.lock().unwrap();
+            assert_eq!(
+                upload_result_state(&netdir, &inner.time_periods).0,
+                State::Running
+            );
+            assert!(
+                inner
+                    .time_periods
+                    .iter()
+                    .flat_map(|ctx| &ctx.hs_dirs)
+                    .all(|(_, status)| *status == DescriptorStatus::Clean)
+            );
+            assert_eq!(
+                inner
+                    .time_periods
+                    .iter()
+                    .map(|ctx| ctx.upload_results.len())
+                    .sum::<usize>(),
+                expected_successes + affected_periods
             );
         });
     }
