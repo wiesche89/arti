@@ -175,6 +175,8 @@ pub(super) struct Reactor<R: Runtime, M: Mockable> {
     ///
     /// A copy of this sender is handed to each upload task.
     upload_task_complete_tx: mpsc::Sender<TimePeriodUploadResult>,
+    /// Current publication per period; superseded work is cancelled on removal.
+    uploads: Vec<PendingUpload>,
     /// A sender for notifying any pending upload tasks that the reactor is shutting down.
     ///
     /// Receivers can use this channel to find out when reactor is dropped.
@@ -640,6 +642,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             publish_status_tx,
             upload_task_complete_rx,
             upload_task_complete_tx,
+            uploads: Vec::new(),
             shutdown_tx,
             path_resolver,
             update_from_pow_manager_rx,
@@ -856,6 +859,14 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// Handle a batch of upload outcomes,
     /// possibly updating the status of the descriptor for the corresponding HSDirs.
     fn handle_upload_results(&self, results: TimePeriodUploadResult) {
+        // Cancellation cannot retract a result already queued in the channel.
+        if !self.uploads.iter().any(|upload| {
+            upload.period == results.time_period
+                && Arc::ptr_eq(&upload.generation, &results.generation)
+        }) {
+            trace!(time_period=?results.time_period, "ignoring superseded upload results");
+            return;
+        }
         let mut inner = self.inner.lock().expect("poisoned lock");
         let inner = &mut *inner;
 
@@ -1285,7 +1296,8 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     }
 
     /// Mark the descriptor dirty for all time periods.
-    fn mark_all_dirty(&self) {
+    fn mark_all_dirty(&mut self) {
+        self.uploads.clear();
         trace!("marking the descriptor dirty for all time periods");
 
         self.inner
@@ -1299,7 +1311,8 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// Mark the descriptor dirty for the specified time period.
     ///
     /// Returns `true` if the specified period is still relevant, and `false` otherwise.
-    fn mark_dirty(&self, period: &TimePeriod) -> bool {
+    fn mark_dirty(&mut self, period: &TimePeriod) -> bool {
+        self.uploads.retain(|upload| upload.period != *period);
         let mut inner = self.inner.lock().expect("poisoned lock");
         let period_ctx = inner
             .time_periods
@@ -1391,6 +1404,12 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
         let _ = inner.last_uploaded.insert(now);
 
+        self.uploads.retain(|upload| {
+            inner
+                .time_periods
+                .iter()
+                .any(|ctx| ctx.params.time_period() == upload.period)
+        });
         for period_ctx in inner.time_periods.iter_mut() {
             let upload_task_complete_tx = self.upload_task_complete_tx.clone();
 
@@ -1434,6 +1453,14 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
             let params = period_ctx.params.clone();
             let shutdown_rx = self.shutdown_tx.subscribe();
+            let generation = Arc::new(());
+            let (abort, registration) = futures::future::AbortHandle::new_pair();
+            self.uploads.retain(|upload| upload.period != time_period);
+            self.uploads.push(PendingUpload {
+                period: time_period,
+                generation: generation.clone(),
+                abort,
+            });
 
             // Spawn a task to upload the descriptor to all HsDirs of this time period.
             //
@@ -1443,7 +1470,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 .imm
                 .runtime
                 .spawn(async move {
-                    if let Err(e) = Self::upload_for_time_period(
+                    let upload = Self::upload_for_time_period(
                         hs_dirs,
                         &netdir,
                         config,
@@ -1453,8 +1480,9 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                         authorized_clients.clone(),
                         upload_task_complete_tx,
                         shutdown_rx,
-                    )
-                    .await
+                        generation,
+                    );
+                    if let Ok(Err(e)) = futures::future::Abortable::new(upload, registration).await
                     {
                         error_report!(
                             e,
@@ -1486,6 +1514,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
         authorized_clients: Option<Arc<RestrictedDiscoveryKeys>>,
         mut upload_task_complete_tx: mpsc::Sender<TimePeriodUploadResult>,
         shutdown_rx: broadcast::Receiver<Void>,
+        generation: Arc<()>,
     ) -> Result<(), FatalError> {
         let time_period = params.time_period();
         trace!(time_period=?time_period, "uploading descriptor to all HSDirs for this time period");
@@ -1723,6 +1752,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
         if upload_task_complete_tx
             .send(TimePeriodUploadResult {
+                generation,
                 time_period,
                 hsdir_result: upload_results,
             })
@@ -2169,10 +2199,27 @@ impl RetriableError for UploadError {
 /// The outcome of uploading a descriptor to the HSDirs from a particular time period.
 #[derive(Debug, Clone)]
 struct TimePeriodUploadResult {
+    /// Identifies the publication that produced this result.
+    generation: Arc<()>,
     /// The time period.
     time_period: TimePeriod,
     /// The upload results.
     hsdir_result: Vec<HsDirUploadStatus>,
+}
+
+/// Cancels retries of obsolete descriptors when a newer publication replaces them.
+struct PendingUpload {
+    /// Publication period.
+    period: TimePeriod,
+    /// Unique identity, also carried by queued results.
+    generation: Arc<()>,
+    /// Cancels the whole batch, including retries and in-flight requests.
+    abort: futures::future::AbortHandle,
+}
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 /// The outcome of uploading a descriptor to a particular HsDir.
@@ -2353,6 +2400,77 @@ mod test {
             assert!(publish_count.load(std::sync::atomic::Ordering::SeqCst) > 0);
             let completed = reactor.upload_task_complete_rx.next().await.unwrap();
             assert_ne!(completed.time_period, first_period);
+            let old = completed.clone();
+            let old_abort = reactor
+                .uploads
+                .iter()
+                .find(|upload| upload.period == old.time_period)
+                .unwrap()
+                .abort
+                .clone();
+            reactor.inner.lock().unwrap().last_uploaded = None;
+            reactor.upload_all().await.unwrap();
+            assert!(
+                old_abort.is_aborted(),
+                "superseded publication must stop retrying"
+            );
+            let before = reactor.inner.lock().unwrap().reupload_timers.len();
+            reactor.handle_upload_results(old);
+            assert_eq!(
+                reactor.inner.lock().unwrap().reupload_timers.len(),
+                before,
+                "late results must not schedule reuploads or change status"
+            );
+            runtime.progress_until_stalled().await;
+            let current = loop {
+                let result = reactor.upload_task_complete_rx.next().await.unwrap();
+                if reactor.uploads.iter().any(|upload| {
+                    result.time_period == completed.time_period
+                        && upload.period == result.time_period
+                        && Arc::ptr_eq(&upload.generation, &result.generation)
+                }) {
+                    break result;
+                }
+            };
+            reactor.handle_upload_results(current.clone());
+            assert_eq!(
+                reactor.inner.lock().unwrap().reupload_timers.len(),
+                before + 1
+            );
+            let mut stale_failure = completed.clone();
+            for result in &mut stale_failure.hsdir_result {
+                result.upload_res = Err(DescUploadRetryError::Bug(internal!("obsolete upload")));
+            }
+            reactor.handle_upload_results(stale_failure);
+            let inner = reactor.inner.lock().unwrap();
+            let period = inner
+                .time_periods
+                .iter()
+                .find(|ctx| ctx.params.time_period() == current.time_period)
+                .unwrap();
+            assert!(
+                period
+                    .upload_results
+                    .iter()
+                    .all(|result| result.upload_res.is_ok())
+            );
+            drop(inner);
+            // An IPT/config change must invalidate queued old results even
+            // before the rate limit permits the replacement upload.
+            reactor.mark_all_dirty();
+            reactor.handle_upload_results(current);
+            assert!(
+                reactor
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .time_periods
+                    .iter()
+                    .all(|ctx| ctx
+                        .hs_dirs
+                        .iter()
+                        .all(|(_, status)| *status == DescriptorStatus::Dirty))
+            );
             assert!(
                 completed
                     .hsdir_result
