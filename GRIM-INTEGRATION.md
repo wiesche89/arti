@@ -1,4 +1,4 @@
-# Grim integration of tor-hsservice 0.44.0
+# Grim integration of Arti 0.44.0
 
 Upstream: https://gitlab.torproject.org/tpo/core/arti
 
@@ -7,9 +7,9 @@ tests, based on upstream release source `46472491e80b1fdfb878efa2a6413deb90885b0
 Use that branch's source commit when reporting the bug upstream.
 
 This integration branch additionally uses the crates.io-normalized manifest for
-`crates/tor-hsservice`. Its dependencies resolve to the unchanged registry releases
+`crates/tor-hsservice` and `crates/tor-circmgr`. Their dependencies resolve to the unchanged registry releases
 instead of the sibling Git workspace packages. This lets Grim patch just
-`tor-hsservice` without introducing a second, incompatible copy of the Tor types.
+these two crates without introducing a second, incompatible copy of the Tor types.
 No dependency versions, circuit timeout, or publication rate limit are changed.
 The integration branch is intended as a Cargo dependency for Grim; use the fix
 branch for development and testing of the complete Arti workspace.
@@ -69,3 +69,27 @@ with a retry delay longer than the overall timeout.
 Source commits for these additions:
 - `2ecb8ebbcc5f0ea8f69d7984f3c8a71ba2ccff59` (retry deadline)
 - `95ea96823f88f1a8c425e573b6498b1588f42a09` (incremental results)
+
+## Replenished circuit pool
+
+When no compatible circuit was initially pooled, acquisition waited only for its
+on-demand build, even if a suitable preemptive circuit became available meanwhile.
+An event now wakes pending acquisitions after insertion. Each acquisition checks
+the existing compatibility predicate again under the pool mutex and exclusively
+removes one circuit. Listening starts before checking, avoiding lost wakeups.
+The existing on-demand future is polled throughout, preserving its error and
+remaining timeout. Losing the race drops that waiter. No additional builds or
+HSDir/introduction requests are launched by the acquisition change.
+
+This addresses waiting for a circuit stem, not a stalled extension to the target
+HSDir or introduction point. Both circuit timeout configuration and publication
+rate limits remain unchanged.
+
+Five regression tests cover replenishment, check/wait races, incompatible paths,
+exclusive acquisition, fallback/error/cancellation, and preservation of a
+60-second build timeout after a notification at 30 seconds. Three fail with the
+old initial-check-only behavior. The complete circuit-manager suite passes with
+80 tests (`--features full,testing`). A library check without vanguards also passes;
+the upstream no-vanguards *test* configuration has unrelated missing test imports.
+
+Source commit (before manifest normalization): `03b4a86d18acc91f569bcc51566699d8d4f2fdc1`.
