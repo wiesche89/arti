@@ -35,3 +35,15 @@ cargo test -p tor-hsservice --lib completed_uploads_survive_a_redundant_schedule
 Before the fix the all-clean case reports `Bootstrapping` instead of `Running`.
 The test also verifies that a clean first period does not block a later pending
 period. The tor-hsservice library suite passed with 40 tests and 2 ignored tests.
+
+## Superseded publications
+
+A second publication could start while an earlier batch was still retrying. The
+old batch continued uploading obsolete descriptors and could replace the newer
+batch's successful status with its late failures. Each period now has one current
+upload task. Replacing it, or invalidating its descriptor after an IPT/config
+change, cancels the old task. A unique publication identity also rejects results
+already queued before cancellation. The mock regression covers replacement,
+late failure after success, and invalidation while waiting for the rate limit.
+
+The 60-second publication rate limit and five-minute batch deadline are unchanged.
