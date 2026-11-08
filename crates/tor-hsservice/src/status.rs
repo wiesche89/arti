@@ -11,6 +11,9 @@ pub struct OnionServiceStatus {
     /// The current high-level state for the descriptor publisher.
     publisher: ComponentStatus,
 
+    /// Successful and required descriptor uploads across all relevant time periods.
+    descriptor_uploads: Option<(usize, usize)>,
+
     /// The current high-level state for the PoW manager.
     #[cfg(feature = "hs-pow-full")]
     pow_manager: ComponentStatus,
@@ -208,6 +211,7 @@ impl OnionServiceStatus {
         Self {
             ipt_mgr: ComponentStatus::new_shutdown(),
             publisher: ComponentStatus::new_shutdown(),
+            descriptor_uploads: None,
             #[cfg(feature = "hs-pow-full")]
             pow_manager: ComponentStatus::new_shutdown(),
         }
@@ -241,6 +245,16 @@ impl OnionServiceStatus {
             | (DegradedReachable, DegradedReachable, _)
             | (Running, Running, _) => DegradedReachable,
         }
+    }
+
+    /// Return successful and required descriptor uploads across all relevant time periods.
+    ///
+    /// Each directory/time-period pair is counted separately. Results reflect the
+    /// latest completed attempt per pair, including during a refresh or retry.
+    /// This is publication coverage, not an end-to-end reachability measurement.
+    /// Returns `None` before the publisher has computed its directory set.
+    pub fn descriptor_uploads(&self) -> Option<(usize, usize)> {
+        self.descriptor_uploads
     }
 
     /// Return the most severe current problem
@@ -373,6 +387,24 @@ impl_status_sender!(IptMgrStatusSender, ipt_mgr);
 impl_status_sender!(PublisherStatusSender, publisher);
 #[cfg(feature = "hs-pow-full")]
 impl_status_sender!(PowManagerStatusSender, pow_manager);
+
+impl PublisherStatusSender {
+    /// Update the publisher state and its descriptor publication coverage together.
+    pub(crate) fn send_with_uploads(
+        &self,
+        state: State,
+        err: Option<Problem>,
+        uploaded: usize,
+        total: usize,
+    ) {
+        let mut tx = self.0.0.lock().expect("Poisoned lock");
+        let mut status = tx.borrow().clone();
+        status.publisher.state = state;
+        status.publisher.latest_error = err;
+        status.descriptor_uploads = Some((uploaded, total));
+        tx.maybe_send(|_| status);
+    }
+}
 
 impl StatusSender {
     /// Create a new StatusSender with a given initial status.

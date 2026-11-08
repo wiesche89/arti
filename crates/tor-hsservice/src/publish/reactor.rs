@@ -1260,7 +1260,16 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             .ok_or_else(|| internal!("handling upload results without netdir?!"))?;
 
         let (state, err) = upload_result_state(netdir, &inner.time_periods);
-        self.imm.status_tx.send(state, err);
+        let uploaded = inner
+            .time_periods
+            .iter()
+            .flat_map(|ctx| &ctx.upload_results)
+            .filter(|result| result.upload_res.is_ok())
+            .count();
+        let total = inner.time_periods.iter().map(|ctx| ctx.hs_dirs.len()).sum();
+        self.imm
+            .status_tx
+            .send_with_uploads(state, err, uploaded, total);
 
         Ok(())
     }
