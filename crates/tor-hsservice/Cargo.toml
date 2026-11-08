@@ -95,8 +95,8 @@ derive_builder = { version = "0.11.2", package = "derive_builder_fork_arti" }
 derive_more = { version = "2.1.1", features = ["full"] }
 digest = "0.11.3"
 educe = "0.4.23"
-equix = { path = "../equix", version = "0.8.0", optional = true }
-fs-mistrust = { path = "../fs-mistrust", version = "0.16.1", features = ["serde"] }
+equix = { version = "0.8.0", optional = true }
+fs-mistrust = { version = "0.16.1", features = ["serde"] }
 futures = "0.3.34"
 growable-bloom-filter = "2.1.1"
 hex = "0.4"
@@ -106,61 +106,61 @@ k12 = "0.5.1"
 metrics = { version = "0.24.6", optional = true }
 num-traits = { version = "0.2.19", optional = true }
 once_cell = "1"
-oneshot-fused-workaround = { path = "../oneshot-fused-workaround", version = "0.8.0" }
+oneshot-fused-workaround = { version = "0.8.0" }
 postage = { version = "0.5.0", default-features = false, features = ["futures-traits"] }
 rand = "0.10.3"
 rand_core = "0.10.1"
-retry-error = { version = "0.14.0", path = "../retry-error" }
-safelog = { path = "../safelog", version = "0.10.1" }
+retry-error = { version = "0.14.0" }
+safelog = { version = "0.10.1" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_with = "3.24.0"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2"
-tor-async-utils = { path = "../tor-async-utils", version = "0.48.0" }
-tor-basic-utils = { path = "../tor-basic-utils", version = "0.48.0" }
-tor-bytes = { version = "0.48.0", path = "../tor-bytes" }
-tor-cell = { version = "0.48.0", path = "../tor-cell", features = ["hs"] }
-tor-checkable = { version = "0.48.0", path = "../tor-checkable", optional = true }
-tor-circmgr = { version = "0.48.0", path = "../tor-circmgr", features = ["hs-service", "send-control-msg"] }
-tor-config = { version = "0.48.0", path = "../tor-config" }
-tor-config-path = { version = "0.48.0", path = "../tor-config-path" }
-tor-dirclient = { path = "../tor-dirclient", version = "0.48.0", default-features = false, features = ["hs-service"] }
-tor-error = { version = "0.48.0", path = "../tor-error" }
-tor-hscrypto = { version = "0.48.0", path = "../tor-hscrypto", features = ["ope"] }
-tor-keymgr = { version = "0.48.0", path = "../tor-keymgr", features = ["keymgr"] }
-tor-linkspec = { version = "0.48.0", path = "../tor-linkspec", features = ["verbatim", "decode"] }
-tor-llcrypto = { version = "0.48.0", path = "../tor-llcrypto" }
-tor-log-ratelim = { path = "../tor-log-ratelim", version = "0.48.0" }
-tor-netdir = { version = "0.48.0", path = "../tor-netdir", features = ["hs-service"] }
-tor-netdoc = { version = "0.48.0", path = "../tor-netdoc", features = ["hs-service"] }
-tor-persist = { version = "0.48.0", path = "../tor-persist", features = ["state-dir"] }
-tor-proto = { version = "0.48.0", path = "../tor-proto", features = [
+tor-async-utils = { version = "0.48.0" }
+tor-basic-utils = { version = "0.48.0" }
+tor-bytes = { version = "0.48.0" }
+tor-cell = { version = "0.48.0", features = ["hs"] }
+tor-checkable = { version = "0.48.0", optional = true }
+tor-circmgr = { version = "0.48.0", features = ["hs-service", "send-control-msg"] }
+tor-config = { version = "0.48.0" }
+tor-config-path = { version = "0.48.0" }
+tor-dirclient = { version = "0.48.0", default-features = false, features = ["hs-service"] }
+tor-error = { version = "0.48.0" }
+tor-hscrypto = { version = "0.48.0", features = ["ope"] }
+tor-keymgr = { version = "0.48.0", features = ["keymgr"] }
+tor-linkspec = { version = "0.48.0", features = ["verbatim", "decode"] }
+tor-llcrypto = { version = "0.48.0" }
+tor-log-ratelim = { version = "0.48.0" }
+tor-netdir = { version = "0.48.0", features = ["hs-service"] }
+tor-netdoc = { version = "0.48.0", features = ["hs-service"] }
+tor-persist = { version = "0.48.0", features = ["state-dir"] }
+tor-proto = { version = "0.48.0", features = [
     "experimental-api",
     "hs-service",
     "send-control-msg",
 ] }
-tor-protover = { version = "0.48.0", path = "../tor-protover" }
-tor-relay-selection = { path = "../tor-relay-selection", version = "0.48.0" }
-tor-rtcompat = { version = "0.48.0", path = "../tor-rtcompat" }
+tor-protover = { version = "0.48.0" }
+tor-relay-selection = { version = "0.48.0" }
+tor-rtcompat = { version = "0.48.0" }
 tracing = "0.1.44"
 void = "1"
-web-time-compat = { version = "0.3.0", path = "../web-time-compat" }
+web-time-compat = { version = "0.3.0" }
 
 [dev-dependencies]
 libc = { version = "0.2", default-features = false }
 rmp-serde = "1"
 serde_json = "1.0.154"
-slotmap-careful = { path = "../slotmap-careful", version = "0.9.0" }
+slotmap-careful = { version = "0.9.0" }
 tempfile = "3"
-test-temp-dir = { version = "0.9.0", path = "../test-temp-dir" }
-tor-config = { version = "0.48.0", path = "../tor-config", features = ["testing"] }
-tor-key-forge = { version = "0.48.0", path = "../tor-key-forge" }
-tor-keymgr = { version = "0.48.0", path = "../tor-keymgr", features = ["keymgr", "testing"] }
-tor-llcrypto = { version = "0.48.0", path = "../tor-llcrypto", features = ["testing"] }
-tor-netdir = { version = "0.48.0", path = "../tor-netdir", features = ["hs-service", "testing"] }
-tor-netdoc = { path = "../tor-netdoc", version = "0.48.0", features = ["testing"] }
-tor-persist = { version = "0.48.0", path = "../tor-persist", features = ["testing"] }
-tor-rtmock = { path = "../tor-rtmock", version = "0.48.0" }
+test-temp-dir = { version = "0.9.0" }
+tor-config = { version = "0.48.0", features = ["testing"] }
+tor-key-forge = { version = "0.48.0" }
+tor-keymgr = { version = "0.48.0", features = ["keymgr", "testing"] }
+tor-llcrypto = { version = "0.48.0", features = ["testing"] }
+tor-netdir = { version = "0.48.0", features = ["hs-service", "testing"] }
+tor-netdoc = { version = "0.48.0", features = ["testing"] }
+tor-persist = { version = "0.48.0", features = ["testing"] }
+tor-rtmock = { version = "0.48.0" }
 tracing-test = "0.2.6"
 walkdir = "2"
 

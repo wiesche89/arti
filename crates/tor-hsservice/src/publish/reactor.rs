@@ -1372,10 +1372,11 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             }
         }
 
-        let mut inner = self.inner.lock().expect("poisoned lock");
-        let inner = &mut *inner;
+        let mut inner_guard = self.inner.lock().expect("poisoned lock");
+        let inner = &mut *inner_guard;
 
         let _ = inner.last_uploaded.insert(now);
+        let mut upload_started = false;
 
         for period_ctx in inner.time_periods.iter_mut() {
             let upload_task_complete_tx = self.upload_task_complete_tx.clone();
@@ -1396,7 +1397,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
             if hs_dirs.is_empty() {
                 trace!("the descriptor is clean for all HSDirs. Nothing to do");
-                return Ok(());
+                continue;
             }
 
             let time_period = period_ctx.params.time_period();
@@ -1451,8 +1452,13 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                     }
                 })
                 .map_err(|e| FatalError::from_spawn("upload_for_time_period task", e))?;
+            upload_started = true;
         }
 
+        drop(inner_guard);
+        if !upload_started {
+            self.upload_result_to_svc_status()?;
+        }
         Ok(())
     }
 
