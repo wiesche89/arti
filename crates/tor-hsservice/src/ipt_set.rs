@@ -190,6 +190,36 @@ pub(crate) struct IptsPublisherUploadView {
 /// Core shared state
 type Shared = Arc<Mutex<PublishIptSet>>;
 
+/// Public descriptor inputs used to suppress unchanged publication notifications.
+#[derive(PartialEq)]
+struct PublicationIpt {
+    lid: IptLocalId,
+    link_specifiers: Vec<tor_linkspec::EncodedLinkSpec>,
+    ipt_ntor_key: [u8; 32],
+    ipt_sid_key: [u8; 32],
+    svc_ntor_key: [u8; 32],
+}
+
+impl PublishIptSet {
+    /// Snapshot public inputs only; this does not authorize a publication attempt.
+    fn publication_inputs(&self) -> Option<(Duration, Vec<PublicationIpt>)> {
+        self.ipts.as_ref().map(|set| {
+            let ipts = set
+                .ipts
+                .iter()
+                .map(|entry| PublicationIpt {
+                    lid: entry.lid,
+                    link_specifiers: entry.ipt.link_specifiers().to_vec(),
+                    ipt_ntor_key: *entry.ipt.ipt_ntor_key().as_bytes(),
+                    ipt_sid_key: *entry.ipt.ipt_sid_key().as_bytes(),
+                    svc_ntor_key: *entry.ipt.svc_ntor_key().as_bytes(),
+                })
+                .collect();
+            (set.lifetime, ipts)
+        })
+    }
+}
+
 /// Mutex guard that will notify when dropped
 ///
 /// Returned by [`IptsManagerView::borrow_for_update`]
@@ -199,6 +229,9 @@ struct NotifyingBorrow<'v, R: SleepProvider> {
     #[deref(forward)]
     #[deref_mut(forward)]
     guard: MutexGuard<'v, PublishIptSet>,
+
+    /// Public descriptor inputs before the manager update.
+    publication_inputs: Option<(Duration, Vec<PublicationIpt>)>,
 
     /// To be notified on drop
     notify: &'v mut mpsc::Sender<()>,
@@ -248,13 +281,14 @@ impl IptsManagerView {
     ///
     /// The returned value is a lock guard.
     /// (It is not `Send` so cannot be held across await points.)
-    /// The publisher will be notified when it is dropped.
+    /// The publisher will be notified on drop if its descriptor inputs changed.
     pub(crate) fn borrow_for_update(
         &mut self,
         runtime: impl SleepProvider,
     ) -> impl std::ops::DerefMut<Target = PublishIptSet> + '_ {
         let guard = lock_shared(&self.shared);
         NotifyingBorrow {
+            publication_inputs: guard.publication_inputs(),
             guard,
             notify: &mut self.notify,
             runtime,
@@ -275,7 +309,9 @@ impl<R: SleepProvider> Drop for NotifyingBorrow<'_, R> {
         // Channel disconnected?  The publisher has crashed or terminated,
         // but we are not in a position to fail and shut down the establisher.
         // If our HS is shutting down, the manager will be shut down by other means.
-        let _: Result<(), mpsc::TrySendError<_>> = self.notify.try_send(());
+        if self.publication_inputs != self.guard.publication_inputs() {
+            let _: Result<(), mpsc::TrySendError<_>> = self.notify.try_send(());
+        }
 
         let save_outcome = self.guard.save(&self.runtime);
         log_ratelim!(
