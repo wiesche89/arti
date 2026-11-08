@@ -193,10 +193,15 @@ type Shared = Arc<Mutex<PublishIptSet>>;
 /// Public descriptor inputs used to suppress unchanged publication notifications.
 #[derive(PartialEq)]
 struct PublicationIpt {
+    /// Local identifier used to correlate publication inputs.
     lid: IptLocalId,
+    /// Public relay addresses and identities advertised in the descriptor.
     link_specifiers: Vec<tor_linkspec::EncodedLinkSpec>,
+    /// Public key used to extend a circuit to the introduction point.
     ipt_ntor_key: [u8; 32],
+    /// Public key identifying the service at the introduction point.
     ipt_sid_key: [u8; 32],
+    /// Public key for encrypting the service handshake.
     svc_ntor_key: [u8; 32],
 }
 
