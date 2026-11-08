@@ -437,6 +437,8 @@ struct Inner {
     //
     // See https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/1971#note_2994950
     reupload_timers: BinaryHeap<ReuploadTimer>,
+    /// Retry failed HSDirs without advancing the regular descriptor refresh.
+    retry_at: Option<Instant>,
     /// The restricted discovery authorized clients.
     ///
     /// `None`, unless the service is running in restricted discovery mode.
@@ -534,7 +536,19 @@ impl TimePeriodContext {
 
     /// Update the upload result for this time period.
     fn set_upload_results(&mut self, upload_results: Vec<HsDirUploadStatus>) {
-        self.upload_results = upload_results;
+        for result in upload_results {
+            if let Some(old) = self
+                .upload_results
+                .iter_mut()
+                .find(|old| old.relay_ids == result.relay_ids)
+            {
+                if result.revision_counter >= old.revision_counter {
+                    *old = result;
+                }
+            } else {
+                self.upload_results.push(result);
+            }
+        }
     }
 }
 
@@ -631,6 +645,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             netdir: None,
             last_uploaded: None,
             reupload_timers: Default::default(),
+            retry_at: None,
             authorized_clients,
         };
 
@@ -715,6 +730,21 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             }
         }
 
+        let retry_tracking = TrackingNow::now(&self.imm.runtime);
+        let retry = {
+            let mut inner = self.inner.lock().expect("poisoned lock");
+            if inner.retry_at.is_some_and(|when| when <= retry_tracking) {
+                inner.retry_at = None;
+                true
+            } else {
+                false
+            }
+        };
+        if retry {
+            debug!(nickname=%self.imm.nickname, "retrying failed descriptor uploads");
+            self.upload_all(true).await?;
+        }
+
         let reupload_tracking = TrackingNow::now(&self.imm.runtime);
         let mut reupload_periods = vec![];
         {
@@ -759,6 +789,9 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             },
             () = upload_rate_lim.wait_for_earliest(&self.imm.runtime).fuse() => {
                 self.expire_rate_limit().await?;
+            },
+            () = retry_tracking.wait_for_earliest(&self.imm.runtime).fuse() => {
+                return Ok(ShutdownStatus::Continue);
             },
             () = reupload_tracking.wait_for_earliest(&self.imm.runtime).fuse() => {
                 // Run another iteration, executing run_once again. This time, we will remove the
@@ -837,7 +870,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 // Our PublishStatus changed -- are we ready to publish?
                 if should_upload == PublishStatus::UploadScheduled {
                     self.update_publish_status_unless_waiting(PublishStatus::Idle).await?;
-                    self.upload_all().await?;
+                    self.upload_all(false).await?;
                 }
             }
             update_tp_pow_seed = self.update_from_pow_manager_rx.next().fuse() => {
@@ -846,7 +879,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                     return Ok(ShutdownStatus::Terminate);
                 };
                 self.mark_dirty(&time_period);
-                self.upload_all().await?;
+                self.upload_all(false).await?;
             }
         }
 
@@ -884,18 +917,22 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
         // TODO SPEC: Control republish period using a consensus parameter?
         let minutes = rng.gen_range_checked(60..=120).expect("low > high?!");
         let duration = Duration::from_secs(minutes * 60);
-        let reupload_when = self.imm.runtime.now() + duration;
+        let mut reupload_when = self.imm.runtime.now() + duration;
         let time_period = period.params.time_period();
 
+        inner.reupload_timers.retain(|timer| {
+            if timer.period == time_period {
+                reupload_when = reupload_when.min(timer.when);
+                false
+            } else {
+                true
+            }
+        });
         info!(
             time_period=?time_period,
             "reuploading descriptor in {}",
-            humantime::format_duration(duration),
+            humantime::format_duration(reupload_when.saturating_duration_since(self.imm.runtime.now())),
         );
-
-        inner
-            .reupload_timers
-            .retain(|timer| timer.period != time_period);
         inner.reupload_timers.push(ReuploadTimer {
             period: time_period,
             when: reupload_when,
@@ -913,6 +950,14 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 // Continue processing the rest of the results
                 continue;
             };
+
+            // A late batch must not undo a newer outcome for this HSDir.
+            if period.upload_results.iter().any(|old| {
+                old.relay_ids == upload_res.relay_ids
+                    && old.revision_counter > upload_res.revision_counter
+            }) {
+                continue;
+            }
 
             if upload_res.upload_res.is_ok() {
                 let update_last_successful = match period.last_successful {
@@ -935,12 +980,22 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                     // updates in batches was the correct decision here.
                     *status = DescriptorStatus::Clean;
                 }
+            } else {
+                *status = DescriptorStatus::Dirty;
             }
 
             upload_results.push(upload_res);
         }
 
         period.set_upload_results(upload_results);
+        if period
+            .upload_results
+            .iter()
+            .any(|result| result.upload_res.is_err())
+        {
+            let when = self.imm.runtime.now() + UPLOAD_RATE_LIM_THRESHOLD;
+            inner.retry_at = Some(inner.retry_at.map_or(when, |old| old.min(when)));
+        }
     }
 
     /// Maybe update our list of HsDirs.
@@ -1349,7 +1404,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// The results are received and processed in the main loop of the reactor.
     ///
     /// Returns an error if it fails to spawn a task, or if an internal error occurs.
-    async fn upload_all(&mut self) -> Result<(), FatalError> {
+    async fn upload_all(&mut self, failed_only: bool) -> Result<(), FatalError> {
         trace!("starting descriptor upload task...");
 
         // Abort the upload entirely if we have an empty list of authorized clients
@@ -1390,7 +1445,12 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 .hs_dirs
                 .iter()
                 .filter_map(|(relay_id, status)| {
-                    if *status == DescriptorStatus::Dirty {
+                    if *status == DescriptorStatus::Dirty
+                        && (!failed_only
+                            || period_ctx.upload_results.iter().any(|result| {
+                                result.relay_ids == *relay_id && result.upload_res.is_err()
+                            }))
+                    {
                         Some(relay_id.clone())
                     } else {
                         None
@@ -1788,7 +1848,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// by [`BackoffSchedule::overall_timeout`] elapses. Individual attempts are timed out
     /// according to the [`BackoffSchedule::single_attempt_timeout`].
     /// This function gives up after the overall timeout elapses,
-    /// declaring the upload a failure, and never retrying it again.
+    /// declaring this batch a failure. The reactor separately retries failed HSDirs.
     ///
     /// See also [`BackoffSchedule`].
     async fn upload_descriptor_with_retries(

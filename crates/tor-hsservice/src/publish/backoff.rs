@@ -116,8 +116,11 @@ impl<B: BackoffSchedule, R: Runtime> Runner<B, R> {
                             return Err(BackoffError::ExplicitStop(errors));
                         };
 
-                        // Introduce the specified delay between retries
-                        let () = self.runtime.sleep(delay).await;
+                        // Keep the overall deadline active during backoff too.
+                        select_biased! {
+                            () = overall_timeout => return Err(BackoffError::Timeout(errors)),
+                            () = self.runtime.sleep(delay).fuse() => {},
+                        }
 
                         // Try again unless the entire operation has timed out.
                         continue;
