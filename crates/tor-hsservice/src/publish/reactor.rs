@@ -439,6 +439,8 @@ struct Inner {
     reupload_timers: BinaryHeap<ReuploadTimer>,
     /// Retry failed HSDirs without advancing the regular descriptor refresh.
     retry_at: Option<Instant>,
+    /// Active upload batches, including older descriptor revisions.
+    uploads_in_progress: std::collections::HashMap<TimePeriod, usize>,
     /// The restricted discovery authorized clients.
     ///
     /// `None`, unless the service is running in restricted discovery mode.
@@ -646,6 +648,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             last_uploaded: None,
             reupload_timers: Default::default(),
             retry_at: None,
+            uploads_in_progress: Default::default(),
             authorized_clients,
         };
 
@@ -1426,6 +1429,11 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             let duration_since_upload = now.duration_since(ts);
 
             if duration_since_upload < UPLOAD_RATE_LIM_THRESHOLD {
+                if failed_only {
+                    self.inner.lock().expect("poisoned lock").retry_at =
+                        Some(ts + UPLOAD_RATE_LIM_THRESHOLD);
+                    return Ok(());
+                }
                 return Ok(self.start_rate_limit(UPLOAD_RATE_LIM_THRESHOLD).await?);
             }
         }
@@ -1433,10 +1441,13 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
         let mut inner_guard = self.inner.lock().expect("poisoned lock");
         let inner = &mut *inner_guard;
 
-        let _ = inner.last_uploaded.insert(now);
         let mut upload_started = false;
 
         for period_ctx in inner.time_periods.iter_mut() {
+            let time_period = period_ctx.params.time_period();
+            if failed_only && inner.uploads_in_progress.contains_key(&time_period) {
+                continue;
+            }
             let upload_task_complete_tx = self.upload_task_complete_tx.clone();
 
             // Figure out which HsDirs we need to upload the descriptor to (some of them might already
@@ -1463,7 +1474,6 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 continue;
             }
 
-            let time_period = period_ctx.params.time_period();
             // This scope exists because rng is not Send, so it needs to fall out of scope before we
             // await anything.
             let netdir = Arc::clone(
@@ -1484,6 +1494,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
             let params = period_ctx.params.clone();
             let shutdown_rx = self.shutdown_tx.subscribe();
+            let state = Arc::clone(&self.inner);
 
             // Spawn a task to upload the descriptor to all HsDirs of this time period.
             //
@@ -1493,7 +1504,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 .imm
                 .runtime
                 .spawn(async move {
-                    if let Err(e) = Self::upload_for_time_period(
+                    let result = Self::upload_for_time_period(
                         hs_dirs,
                         &netdir,
                         config,
@@ -1504,8 +1515,15 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                         upload_task_complete_tx,
                         shutdown_rx,
                     )
-                    .await
+                    .await;
                     {
+                        let mut inner = state.lock().expect("poisoned lock");
+                        if let Some(count) = inner.uploads_in_progress.get_mut(&time_period) {
+                            *count = count.saturating_sub(1);
+                        }
+                        inner.uploads_in_progress.retain(|_, count| *count > 0);
+                    }
+                    if let Err(e) = result {
                         error_report!(
                             e,
                             "descriptor upload failed for HS service {} and time period {:?}",
@@ -1515,7 +1533,11 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                     }
                 })
                 .map_err(|e| FatalError::from_spawn("upload_for_time_period task", e))?;
+            *inner.uploads_in_progress.entry(time_period).or_default() += 1;
             upload_started = true;
+        }
+        if upload_started {
+            inner.last_uploaded = Some(now);
         }
 
         drop(inner_guard);
