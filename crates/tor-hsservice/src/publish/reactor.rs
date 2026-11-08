@@ -383,7 +383,7 @@ impl<R: Runtime> Mockable for Real<R> {
         let est_total = est_build + est_roundtrip * 2;
         // We always allow _at least_ this much time, in case our estimate is
         // ridiculously low.
-        let min_timeout = Duration::from_secs(30);
+        let min_timeout = Duration::from_secs(120);
         max(est_total, min_timeout)
     }
 }
@@ -893,6 +893,9 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             humantime::format_duration(duration),
         );
 
+        inner
+            .reupload_timers
+            .retain(|timer| timer.period != time_period);
         inner.reupload_timers.push(ReuploadTimer {
             period: time_period,
             when: reupload_when,
@@ -1797,7 +1800,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
         imm: Arc<Immutable<R, M>>,
     ) -> UploadResult {
         /// The base delay to use for the backoff schedule.
-        const BASE_DELAY_MSEC: u32 = 1000;
+        const BASE_DELAY_MSEC: u32 = 10_000;
         let schedule = PublisherBackoffSchedule {
             retry_delay: RetryDelay::from_msec(BASE_DELAY_MSEC),
             mockable: imm.mockable.clone(),
